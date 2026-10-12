@@ -8,6 +8,7 @@ const config = { length: 1.8, mass: .085, drag: .18, wind: 0, entropy: false };
 let world, bob, pivot, ropeLength = config.length, released = false, reading = false;
 let scene, camera, renderer, controls, bobMesh, cord, halo, clock;
 let entropySeed = Math.random();
+let intention = '';
 
 await RAPIER.init();
 init();
@@ -65,7 +66,23 @@ function constrainBob(dt) {
   if (released) { const flutter = .035 + config.wind*.04; bob.addForce({x:(Math.random()-.5)*flutter,y:0,z:(Math.random()-.5)*flutter}, true); }
 }
 
-function animate() { requestAnimationFrame(animate); const dt = Math.min(clock.getDelta(), .033); constrainBob(dt); world.timestep = dt; world.step();
+function keepBobVisible() {
+  const p = bob.translation();
+  const position = new THREE.Vector3(p.x, p.y, p.z);
+  const distance = position.distanceTo(pivot);
+  // A physics guard only runs if an invalid/explosive state is detected. This
+  // keeps the cord from ever taking the bob out of the camera's usable space.
+  if (!Number.isFinite(p.x + p.y + p.z) || distance > ropeLength * 1.45 || p.y < -2.65) resetBody();
+}
+
+function resetBody() {
+  const x = Math.min(.52, ropeLength * .28);
+  bob.setTranslation({x, y:pivot.y-Math.sqrt(Math.max(.01, ropeLength*ropeLength-x*x)), z:0}, true);
+  bob.setLinvel({x:0,y:0,z:0}, true);
+  bob.setAngvel({x:0,y:0,z:0}, true);
+}
+
+function animate() { requestAnimationFrame(animate); const dt = Math.min(clock.getDelta(), .033); constrainBob(dt); world.timestep = dt; world.step(); keepBobVisible();
   const p=bob.translation(); bobMesh.position.set(p.x,p.y,p.z); bobMesh.rotation.x += dt*1.3; bobMesh.rotation.z += dt*.8; halo.position.set(p.x,-2.13,p.z); halo.scale.setScalar(1+Math.max(0, bob.linvel().y)*.02); halo.material.opacity=.18+Math.min(.35, Math.abs(bob.linvel().x)*.07);
   cord.geometry.setFromPoints([pivot, bobMesh.position]); controls.update(); renderer.render(scene,camera);
   if(reading && performance.now()-reading > 6200) settleReading();
@@ -74,10 +91,13 @@ function animate() { requestAnimationFrame(animate); const dt = Math.min(clock.g
 function bindUI() {
   [['length','length-out',v=>`${(+v).toFixed(1)} m`],['mass','mass-out',v=>`${v} g`],['drag','drag-out',v=>+v.toFixed(2)],['wind','wind-out',v=>`${(+v).toFixed(1)} m/s`]].forEach(([id,out,fmt]) => $(id).addEventListener('input', e => { $(out).value=fmt(+e.target.value); config[id]=id==='mass'?+e.target.value/1000:+e.target.value; if(id==='length') ropeLength=config.length; }));
   $('release').addEventListener('click', release); $('reset').addEventListener('click', reset);
+  $('question').addEventListener('input', e => { intention = e.target.value.trim(); });
+  $('question').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); release(); } });
   $('randomorg').addEventListener('change', async e => { config.entropy=e.target.checked; $('entropy-label').textContent=e.target.checked?'Fetching random.org…':'Local system noise'; if(e.target.checked){ try { const t=await fetch('https://www.random.org/integers/?num=1&min=1&max=999999&col=1&base=10&format=plain&rnd=new'); entropySeed=(parseInt(await t.text(),10)||Math.random())/999999; $('entropy-label').textContent='random.org atmospheric noise'; }catch{ $('entropy-label').textContent='Fallback local system noise'; } }});
-  addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+  const resize = () => { const bounds = $('canvas').getBoundingClientRect(); camera.aspect=bounds.width/bounds.height; camera.updateProjectionMatrix(); renderer.setSize(bounds.width,bounds.height); };
+  addEventListener('resize', resize); window.visualViewport?.addEventListener('resize', resize);
 }
 
-function release() { if(reading) return; const q=$('question').value.trim(); released=true; reading=performance.now(); const a=Math.random()*Math.PI*2, impulse=.65+Math.random()*.45; bob.applyImpulse({x:Math.cos(a)*impulse,y:0,z:Math.sin(a)*impulse},true); $('release').textContent='Reading in motion…'; $('state').textContent='INTERPRETING MOTION'; $('answer').textContent='•••'; $('detail').textContent=q ? `Listening to: “${q}”` : 'The pendulum is finding its path.'; }
+function release() { if(reading) return; const q=intention || $('question').value.trim(); released=true; reading=performance.now(); const a=Math.random()*Math.PI*2, impulse=.65+Math.random()*.45; bob.applyImpulse({x:Math.cos(a)*impulse,y:0,z:Math.sin(a)*impulse},true); $('release').textContent='Reading in motion…'; $('state').textContent='INTERPRETING MOTION'; $('answer').textContent='•••'; $('detail').textContent=q ? `Listening to: “${q}”` : 'The pendulum is finding its path.'; }
 function settleReading(){ const v=bob.linvel(), angle=Math.atan2(v.x,v.z); const options=['YES','NO','UNCLEAR','ASK AGAIN']; const index=Math.abs(Math.floor((angle+entropySeed*13)*2.7))%options.length; $('answer').textContent=options[index]; $('detail').textContent=options[index]==='YES'?'The movement settles with an open current.':options[index]==='NO'?'The motion closes toward a boundary.':'The field remains unsettled — return when clear.'; $('state').textContent='READING COMPLETE'; $('release').innerHTML='Release again <span>→</span>'; reading=false; }
-function reset(){ bob.setTranslation({x:.52,y:pivot.y-Math.sqrt(ropeLength*ropeLength-.52*.52),z:0},true); bob.setLinvel({x:0,y:0,z:0},true); released=false; reading=false; $('answer').textContent='—'; $('detail').textContent='Set your question, then release the pendulum.'; $('state').textContent='AWAITING INTENTION'; $('release').innerHTML='Release pendulum <span>→</span>'; }
+function reset(){ resetBody(); released=false; reading=false; $('answer').textContent='—'; $('detail').textContent='Set your question, then release the pendulum.'; $('state').textContent='AWAITING INTENTION'; $('release').innerHTML='Release pendulum <span>→</span>'; }
