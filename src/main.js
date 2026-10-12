@@ -9,6 +9,9 @@ let world, bob, pivot, ropeLength = config.length, released = false, reading = f
 let scene, camera, renderer, controls, bobMesh, cord, halo, clock;
 let entropySeed = Math.random();
 let intention = '';
+let readingMotion = { x: 0, z: 0, samples: 0 };
+const physicsStep = 1 / 120;
+let physicsAccumulator = 0;
 
 await RAPIER.init();
 init();
@@ -50,20 +53,36 @@ function makePendulum() {
 
 function createPhysics() {
   world = new RAPIER.World({x:0,y:-9.81,z:0});
-  const body = RAPIER.RigidBodyDesc.dynamic().setTranslation(.52, pivot.y - Math.sqrt(ropeLength*ropeLength-.52*.52), 0).setLinearDamping(0).setAngularDamping(.55).setAdditionalMass(config.mass);
+  const body = RAPIER.RigidBodyDesc.dynamic()
+    .setTranslation(.52, pivot.y - Math.sqrt(ropeLength*ropeLength-.52*.52), 0)
+    .setLinearDamping(0).setAngularDamping(.55).setAdditionalMass(config.mass)
+    .setCanSleep(false);
   bob = world.createRigidBody(body); world.createCollider(RAPIER.ColliderDesc.ball(.24).setDensity(1), bob);
+  // Start with a visible swing along the cord's tangent.
+  bob.setLinvel({ x: .42, y: .127, z: 0 }, true);
 }
 
-function constrainBob(dt) {
+function applyEnvironmentForces() {
   const p = bob.translation(), v = bob.linvel(); const pos = new THREE.Vector3(p.x,p.y,p.z); const vel = new THREE.Vector3(v.x,v.y,v.z);
-  const r = pos.clone().sub(pivot), dist = r.length(), n = r.normalize();
-  const radialVelocity = vel.dot(n); const stretch = dist - ropeLength;
-  // spring constraint maintains a taut cord without hiding real motion
-  const tension = -(stretch * 420 + radialVelocity * 28); bob.addForce({x:n.x*tension,y:n.y*tension,z:n.z*tension}, true);
   const wind = new THREE.Vector3(config.wind * (0.65 + .35 * Math.sin(performance.now()/1100 + entropySeed*10)), 0, config.wind*.26);
   const relative = vel.clone().sub(wind); const speed = relative.length();
   const dragForce = relative.multiplyScalar(-config.drag * speed * 1.7); bob.addForce(dragForce, true);
-  if (released) { const flutter = .035 + config.wind*.04; bob.addForce({x:(Math.random()-.5)*flutter,y:0,z:(Math.random()-.5)*flutter}, true); }
+  const time = performance.now() / 1000;
+  const flutter = released ? .035 + config.wind * .04 : .012;
+  bob.addForce({x:Math.sin(time * 1.7 + entropySeed * 8) * flutter, y:0, z:Math.cos(time * 1.31 + entropySeed * 5) * flutter}, true);
+}
+
+function enforceCordLength() {
+  const p = bob.translation(), v = bob.linvel();
+  const radius = new THREE.Vector3(p.x - pivot.x, p.y - pivot.y, p.z - pivot.z);
+  if (radius.lengthSq() < 1e-8) return;
+  radius.normalize();
+  const position = pivot.clone().addScaledVector(radius, ropeLength);
+  const velocity = new THREE.Vector3(v.x, v.y, v.z);
+  // A taut cord only permits velocity perpendicular to its direction.
+  velocity.addScaledVector(radius, -velocity.dot(radius));
+  bob.setTranslation({x:position.x,y:position.y,z:position.z}, true);
+  bob.setLinvel({x:velocity.x,y:velocity.y,z:velocity.z}, true);
 }
 
 function keepBobVisible() {
@@ -82,8 +101,12 @@ function resetBody() {
   bob.setAngvel({x:0,y:0,z:0}, true);
 }
 
-function animate() { requestAnimationFrame(animate); const dt = Math.min(clock.getDelta(), .033); constrainBob(dt); world.timestep = dt; world.step(); keepBobVisible();
-  const p=bob.translation(); bobMesh.position.set(p.x,p.y,p.z); bobMesh.rotation.x += dt*1.3; bobMesh.rotation.z += dt*.8; halo.position.set(p.x,-2.13,p.z); halo.scale.setScalar(1+Math.max(0, bob.linvel().y)*.02); halo.material.opacity=.18+Math.min(.35, Math.abs(bob.linvel().x)*.07);
+function animate() { requestAnimationFrame(animate); const frameDt = Math.min(clock.getDelta(), .1); physicsAccumulator += frameDt;
+  while (physicsAccumulator >= physicsStep) { applyEnvironmentForces(); world.step(); enforceCordLength(); physicsAccumulator -= physicsStep; }
+  keepBobVisible();
+  const p=bob.translation();
+  if (reading) { readingMotion.x += p.x; readingMotion.z += p.z; readingMotion.samples++; }
+  bobMesh.position.set(p.x,p.y,p.z); bobMesh.rotation.x += frameDt*1.3; bobMesh.rotation.z += frameDt*.8; halo.position.set(p.x,-2.13,p.z); halo.scale.setScalar(1+Math.max(0, bob.linvel().y)*.02); halo.material.opacity=.18+Math.min(.35, Math.abs(bob.linvel().x)*.07);
   cord.geometry.setFromPoints([pivot, bobMesh.position]); controls.update(); renderer.render(scene,camera);
   if(reading && performance.now()-reading > 6200) settleReading();
 }
@@ -93,11 +116,23 @@ function bindUI() {
   $('release').addEventListener('click', release); $('reset').addEventListener('click', reset);
   $('question').addEventListener('input', e => { intention = e.target.value.trim(); });
   $('question').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); release(); } });
-  $('randomorg').addEventListener('change', async e => { config.entropy=e.target.checked; $('entropy-label').textContent=e.target.checked?'Fetching random.org…':'Local system noise'; if(e.target.checked){ try { const t=await fetch('https://www.random.org/integers/?num=1&min=1&max=999999&col=1&base=10&format=plain&rnd=new'); entropySeed=(parseInt(await t.text(),10)||Math.random())/999999; $('entropy-label').textContent='random.org atmospheric noise'; }catch{ $('entropy-label').textContent='Fallback local system noise'; } }});
+  $('randomorg').addEventListener('change', async e => { config.entropy=e.target.checked; $('entropy-label').textContent=e.target.checked?'Fetching random.org…':'Local system noise'; if(e.target.checked){ try { const t=await fetch('https://www.random.org/integers/?num=1&min=1&max=999999&col=1&base=10&format=plain&rnd=new'); const seed=Number.parseInt(await t.text(),10); if(!Number.isFinite(seed)) throw new Error('Invalid random.org response'); entropySeed=seed/999999; $('entropy-label').textContent='random.org atmospheric noise'; }catch{ $('entropy-label').textContent='Fallback local system noise'; } }});
   const resize = () => { const bounds = $('canvas').getBoundingClientRect(); camera.aspect=bounds.width/bounds.height; camera.updateProjectionMatrix(); renderer.setSize(bounds.width,bounds.height); };
   addEventListener('resize', resize); window.visualViewport?.addEventListener('resize', resize);
 }
 
-function release() { if(reading) return; const q=intention || $('question').value.trim(); released=true; reading=performance.now(); const a=Math.random()*Math.PI*2, impulse=.65+Math.random()*.45; bob.applyImpulse({x:Math.cos(a)*impulse,y:0,z:Math.sin(a)*impulse},true); $('release').textContent='Reading in motion…'; $('state').textContent='INTERPRETING MOTION'; $('answer').textContent='•••'; $('detail').textContent=q ? `Listening to: “${q}”` : 'The pendulum is finding its path.'; }
-function settleReading(){ const v=bob.linvel(), angle=Math.atan2(v.x,v.z); const options=['YES','NO','UNCLEAR','ASK AGAIN']; const index=Math.abs(Math.floor((angle+entropySeed*13)*2.7))%options.length; $('answer').textContent=options[index]; $('detail').textContent=options[index]==='YES'?'The movement settles with an open current.':options[index]==='NO'?'The motion closes toward a boundary.':'The field remains unsettled — return when clear.'; $('state').textContent='READING COMPLETE'; $('release').innerHTML='Release again <span>→</span>'; reading=false; }
-function reset(){ resetBody(); released=false; reading=false; $('answer').textContent='—'; $('detail').textContent='Set your question, then release the pendulum.'; $('state').textContent='AWAITING INTENTION'; $('release').innerHTML='Release pendulum <span>→</span>'; }
+function release() { if(reading) return; const q=intention || $('question').value.trim(); released=true; reading=performance.now(); readingMotion={x:0,z:0,samples:0}; entropySeed=nextEntropy(); const a=nextEntropy()*Math.PI*2, impulse=1.35+nextEntropy()*.7; bob.setLinvel({x:Math.cos(a)*impulse,y:0,z:Math.sin(a)*impulse},true); $('release').textContent='Reading in motion…'; $('state').textContent='INTERPRETING MOTION'; $('answer').textContent='•••'; $('detail').textContent=q ? `Listening to: “${q}”` : 'The pendulum is finding its path.'; }
+function nextEntropy() { const bytes = new Uint32Array(1); if (globalThis.crypto?.getRandomValues) { globalThis.crypto.getRandomValues(bytes); return bytes[0] / 4294967296; } return Math.random(); }
+function settleReading(){
+  const v=bob.linvel();
+  const averageX=readingMotion.x/Math.max(1,readingMotion.samples), averageZ=readingMotion.z/Math.max(1,readingMotion.samples);
+  const motionAngle=Math.atan2(averageX + v.x*.22, averageZ + v.z*.22);
+  const motionSignal=(Math.sin(motionAngle)+Math.cos(motionAngle*.73))*0.5;
+  // Each reading samples an independent noise value. Motion influences the
+  // result while the noise prevents similar trajectories from repeating a fixed answer.
+  const chance=Math.max(0,Math.min(.999999,(motionSignal+1)*.34 + nextEntropy()*.32));
+  const answer=chance<.48?'YES':chance<.84?'NO':'UNCLEAR';
+  const messages={YES:'The movement settles with an open current.',NO:'The motion closes toward a boundary.',UNCLEAR:'The field remains unsettled — return when clear.'};
+  $('answer').textContent=answer; $('detail').textContent=messages[answer]; $('state').textContent='READING COMPLETE'; $('release').innerHTML='Release again <span>→</span>'; reading=false;
+}
+function reset(){ resetBody(); released=false; reading=false; readingMotion={x:0,z:0,samples:0}; $('answer').textContent='—'; $('detail').textContent='Set your question, then release the pendulum.'; $('state').textContent='AWAITING INTENTION'; $('release').innerHTML='Release pendulum <span>→</span>'; }
